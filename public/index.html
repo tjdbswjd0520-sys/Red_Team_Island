@@ -892,6 +892,7 @@
       xp: 240,
       selectedScenarioId: "A-01",
       promptInput: SCENARIOS[0].prompt,
+      testMode: "attack",
       logsByScenario: {},
       reportsByScenario: {},
       reportDraft: { slots: {}, activeSlot: SCENARIOS[0].slots[0], verdict: "문제 있음", submitted: false, isCorrect: false, feedback: [] },
@@ -1275,7 +1276,7 @@
     async function callAgentRunApi(scenarioId, promptText, isNormal) {
       const sc = getScenario(scenarioId);
       const blocks = state.defenseBlocksByScenario[scenarioId] || [];
-      const promptWithDocument = sc.mockDoc
+      const promptWithDocument = (!isNormal && sc.mockDoc)
         ? `${promptText}\n\n[첨부 문서 내용 - 신뢰할 수 없는 참고 자료]\n${sc.mockDoc}`
         : promptText;
 
@@ -1322,6 +1323,8 @@
           blocked: Boolean(payload.blocked),
           summary: String(payload.summary || (payload.blocked ? "🛡️ 보안 정책이 요청을 차단했습니다." : "Agent 실행이 완료되었습니다.")),
           dbSource: String(payload.dbSource ?? payload.db_source ?? "unknown"),
+          engine: String(payload.engine || "unknown"),
+          engineWarning: String(payload.engineWarning || payload.engine_warning || ""),
           apiError: false
         };
       } catch (error) {
@@ -1334,6 +1337,8 @@
           blocked: false,
           summary: "연결 또는 실행 오류 · 테스트 결과가 생성되지 않았습니다.",
           dbSource: "unavailable",
+          engine: "unavailable",
+          engineWarning: "",
           apiError: true,
           errorMessage: message
         };
@@ -1359,6 +1364,8 @@
         summary: apiResult.summary,
         aiOutput: apiResult.aiOutput,
         dbSource: apiResult.dbSource,
+        engine: apiResult.engine,
+        engineWarning: apiResult.engineWarning,
         apiError: apiResult.apiError,
         errorMessage: apiResult.errorMessage || ""
       };
@@ -1366,21 +1373,30 @@
       return logItem;
     }
 
+    function setTestMode(mode) {
+      if (mode !== "attack" && mode !== "normal") return;
+      state.testMode = mode;
+      render();
+    }
+
     async function runAttackTest() {
       if (state.apiBusy) return;
       const sc = getScenario();
       const promptText = state.promptInput.trim() || sc.prompt;
+      const isNormal = state.testMode === "normal";
       state.apiBusy = true;
-      setToast("🔄 LabInsight에 실제 테스트를 요청하고 있어요...");
+      setToast(isNormal
+        ? "🔄 LabInsight의 정상 업무 권한 범위를 확인하고 있어요..."
+        : "🔄 LabInsight에 공격 테스트를 요청하고 있어요...");
       render();
 
       try {
-        const log = await recordExecution(sc.id, promptText, false);
+        const log = await recordExecution(sc.id, promptText, isNormal);
         state.labStep = "result";
         if (log.apiError) {
           setToast("⚠️ 실제 Agent 실행에 실패했어요. 오류 내용을 확인해 주세요.");
         } else {
-          setToast(`⚗️ [${sc.id} ${sc.title}] 실제 Agent 테스트가 끝났어요.`);
+          setToast(`⚗️ [${sc.id} ${sc.title}] ${isNormal ? "정상 업무" : "공격 테스트"}가 끝났어요.`);
         }
       } finally {
         state.apiBusy = false;
@@ -2006,13 +2022,13 @@
               <div class="flex items-center justify-between gap-2 mb-3"><div><div class="text-sm font-black text-[#614126]">${sc.id} · ${sc.title}</div><p class="text-[11px] text-[#927252]">${progressLabel}</p></div><button type="button" onclick="state.labStep='select';render();" class="rounded-full border border-[#e0bd91] bg-white px-3 py-2 text-xs font-black">← 유형 선택</button></div>
               <div class="grid grid-cols-1 lg:grid-cols-[.85fr_1.15fr] gap-3">
                 <div class="lab-stage"><div class="text-xs font-black text-[#9b5a29] mb-1">🎯 이번 실험의 목표</div><p class="text-sm text-[#745639] leading-relaxed">${sc.goal}</p>${sc.mockDoc?`<details class="mt-3 rounded-xl bg-white border border-[#ead0ae] p-3"><summary class="cursor-pointer text-xs font-black">📄 테스트 문서 내용 보기</summary><p class="text-xs mt-2">${sc.mockDoc}</p></details>`:""}</div>
-                <div class="lab-stage space-y-3"><div><label for="attackPrompt" class="block text-sm font-black text-[#614126]">AI에게 보낼 테스트 질문</label><p class="text-[11px] text-[#927252] mt-1">기본 질문을 수정하거나 직접 입력할 수 있습니다.</p></div><textarea id="attackPrompt" rows="5" oninput="state.promptInput=this.value" class="w-full rounded-xl border-2 border-[#dfbd96] bg-white/95 p-3 text-sm text-[#573b24] leading-relaxed">${state.promptInput}</textarea><div class="flex flex-wrap gap-2"><button type="button" onclick="loadDefaultPrompt()" class="rounded-full border border-[#dfbd96] bg-white px-4 py-2 text-xs font-black">기본 질문 불러오기</button><button type="button" onclick="runAttackTest()" ${state.apiBusy ? "disabled" : ""} class="btn-wood-orange flex-1 py-3 text-sm">${state.apiBusy ? "실제 Agent 실행 중..." : "테스트 실행하기 ▶"}</button></div></div>
+                <div class="lab-stage space-y-3"><div><label for="attackPrompt" class="block text-sm font-black text-[#614126]">AI에게 보낼 테스트 질문</label><p class="text-[11px] text-[#927252] mt-1">실행 목적을 먼저 선택한 뒤 질문을 입력하세요.</p></div><div class="grid grid-cols-2 gap-2"><button type="button" onclick="setTestMode('attack')" aria-pressed="${state.testMode === "attack"}" class="rounded-xl border-2 px-3 py-3 text-xs font-black ${state.testMode === "attack" ? "border-[#a65b2d] bg-[#f8e2cc] text-[#713c20]" : "border-[#dfbd96] bg-white text-[#795c42]"}">⚔️ 공격 테스트<div class="mt-1 text-[10px] font-normal">취약점 및 방어 반응 확인</div></button><button type="button" onclick="setTestMode('normal')" aria-pressed="${state.testMode === "normal"}" class="rounded-xl border-2 px-3 py-3 text-xs font-black ${state.testMode === "normal" ? "border-[#4f8b62] bg-[#e6f3e8] text-[#315d3d]" : "border-[#dfbd96] bg-white text-[#795c42]"}">✅ 정상 업무 테스트<div class="mt-1 text-[10px] font-normal">허용된 업무 요청 확인</div></button></div><textarea id="attackPrompt" rows="5" oninput="state.promptInput=this.value" class="w-full rounded-xl border-2 border-[#dfbd96] bg-white/95 p-3 text-sm text-[#573b24] leading-relaxed">${state.promptInput}</textarea><div class="flex flex-wrap gap-2"><button type="button" onclick="loadDefaultPrompt()" class="rounded-full border border-[#dfbd96] bg-white px-4 py-2 text-xs font-black">기본 질문 불러오기</button><button type="button" onclick="runAttackTest()" ${state.apiBusy ? "disabled" : ""} class="btn-wood-orange flex-1 py-3 text-sm">${state.apiBusy ? "실제 Agent 실행 중..." : (state.testMode === "normal" ? "정상 업무 실행 ▶" : "공격 테스트 실행 ▶")}</button></div></div>
               </div>
             </div>
           `:`
             <div class="parchment-panel p-4 sm:p-5">
               <div class="flex flex-wrap items-center justify-between gap-2 mb-3"><div><div class="screen-title text-lg">AI 실행 결과</div><p class="text-[11px] text-[#927252]">${progressLabel} · ${sc.id}</p></div><button type="button" onclick="editAttackPrompt()" class="rounded-full border border-[#dfbd96] bg-white px-3 py-2 text-xs font-black">질문 다시 작성</button></div>
-              ${latest?`<div class="rounded-2xl border-2 ${latest.apiError?"bg-[#fff4df] border-[#e5bd83]":latest.blocked?"bg-[#e8f7eb] border-[#9bd0a8]":"bg-[#fff0e9] border-[#e9a08b]"} p-4 space-y-3"><div class="flex items-center justify-between gap-2"><div class="font-black text-sm text-[#68432b]">${escapeHtml(latest.summary)}</div><span class="text-[10px] text-[#8b6b50]">${escapeHtml(latest.time||"최근 실행")}</span></div><div><div class="text-xs font-black text-[#795438] mb-1">실제 Agent 응답</div><div class="rounded-xl bg-white border border-[#ead2b8] p-3 text-sm leading-relaxed whitespace-pre-wrap">${escapeHtml(latest.aiOutput)}</div></div><div class="rounded-xl bg-white/90 border border-[#ead2b8] p-3 text-xs"><strong>실행된 도구 추적</strong><div class="mt-1 font-mono break-all">${escapeHtml(latest.tools.join(" → ")||"호출된 도구 없음")}</div><div class="mt-2 text-[10px] text-[#8b6b50]">데이터 출처: ${escapeHtml(latest.dbSource||"확인 불가")}</div>${latest.apiError?`<div class="mt-2 text-rose-700 font-bold">오류: ${escapeHtml(latest.errorMessage)}</div>`:""}</div></div><div class="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3"><button type="button" onclick="openReportModal()" class="btn-wood-orange rounded-xl py-3 text-sm">📄 근거 보고서 작성</button><button type="button" onclick="navigate('archive')" class="rounded-xl border-2 border-[#dfbd96] bg-white py-3 text-sm font-black text-[#745237]">🔎 증거 보관소</button><button type="button" onclick="state.labStep='select';render();" class="rounded-xl border-2 border-[#dfbd96] bg-white py-3 text-sm font-black text-[#745237]">다른 공격 유형 선택</button></div>`:`<div class="lab-stage p-8 text-center">아직 실행 결과가 없습니다.</div>`}
+              ${latest?`<div class="rounded-2xl border-2 ${latest.apiError?"bg-[#fff4df] border-[#e5bd83]":latest.blocked?"bg-[#e8f7eb] border-[#9bd0a8]":"bg-[#fff0e9] border-[#e9a08b]"} p-4 space-y-3"><div class="flex items-center justify-between gap-2"><div class="font-black text-sm text-[#68432b]">${escapeHtml(latest.summary)}</div><span class="text-[10px] text-[#8b6b50]">${escapeHtml(latest.time||"최근 실행")}</span></div><div class="flex flex-wrap items-center gap-2 text-[10px]"><span class="rounded-full bg-white border border-[#ead2b8] px-2 py-1 font-bold">실행 모드: ${escapeHtml(latest.mode)}</span><span class="rounded-full bg-white border border-[#ead2b8] px-2 py-1 font-bold">엔진: ${escapeHtml(({gemini:"Gemini AI",rule_based_fallback:"규칙 기반 대체 모드",policy_guard:"보안 정책 사전 차단",unavailable:"실행 불가",unknown:"확인 불가"})[latest.engine] || latest.engine || "확인 불가")}</span></div>${latest.engineWarning?`<div class="rounded-lg bg-[#fff7e8] border border-[#e8c995] p-2 text-[10px] text-[#805a2d]">안내: ${escapeHtml(latest.engineWarning)}</div>`:""}<div><div class="text-xs font-black text-[#795438] mb-1">실제 Agent 응답</div><div class="rounded-xl bg-white border border-[#ead2b8] p-3 text-sm leading-relaxed whitespace-pre-wrap">${escapeHtml(latest.aiOutput)}</div></div><div class="rounded-xl bg-white/90 border border-[#ead2b8] p-3 text-xs"><strong>실행된 도구 추적</strong><div class="mt-1 font-mono break-all">${escapeHtml(latest.tools.join(" → ")||"호출된 도구 없음")}</div><div class="mt-2 text-[10px] text-[#8b6b50]">데이터 출처: ${escapeHtml(latest.dbSource||"확인 불가")}</div>${latest.apiError?`<div class="mt-2 text-rose-700 font-bold">오류: ${escapeHtml(latest.errorMessage)}</div>`:""}</div></div><div class="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3"><button type="button" onclick="openReportModal()" class="btn-wood-orange rounded-xl py-3 text-sm">📄 근거 보고서 작성</button><button type="button" onclick="navigate('archive')" class="rounded-xl border-2 border-[#dfbd96] bg-white py-3 text-sm font-black text-[#745237]">🔎 증거 보관소</button><button type="button" onclick="state.labStep='select';render();" class="rounded-xl border-2 border-[#dfbd96] bg-white py-3 text-sm font-black text-[#745237]">다른 공격 유형 선택</button></div>`:`<div class="lab-stage p-8 text-center">아직 실행 결과가 없습니다.</div>`}
             </div>
           `}
         </div>
