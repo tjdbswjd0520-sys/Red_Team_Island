@@ -84,9 +84,13 @@ DEFAULT_SECRETS = [
 
 
 class HospitalDBContext:
+    """Load only the Supabase table requested by an Agent tool.
+
+    This keeps database access aligned with the actual tool-call trace instead of
+    eagerly reading every table before the model has selected a tool.
+    """
     def __init__(self) -> None:
         self.url = os.getenv("SUPABASE_URL", "").rstrip("/")
-        # 새 Supabase Secret Key와 기존 service_role 키 이름을 모두 지원합니다.
         self.key = (
             os.getenv("SUPABASE_SECRET_KEY")
             or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -97,10 +101,9 @@ class HospitalDBContext:
         self.lab_records = [dict(row) for row in DEFAULT_LAB_RECORDS]
         self.billing = [dict(row) for row in DEFAULT_BILLING]
         self.secrets = [dict(row) for row in DEFAULT_SECRETS]
-        self.source = "seed_memory"
-
-        if self.url and self.key:
-            self._try_load_from_supabase()
+        self._loaded_tables: set[str] = set()
+        self._table_sources: Dict[str, str] = {}
+        self.source = "not_queried"
 
     @staticmethod
     def _normalize_lab_row(row: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -143,40 +146,89 @@ class HospitalDBContext:
             raw = response.read().decode("utf-8")
             return json.loads(raw) if raw else None
 
-    def _try_load_from_supabase(self) -> None:
-        try:
-            labs = self._rest_request("GET", "lab_records", {"select": "*", "order": "id.asc"})
-            bills = self._rest_request("GET", "billing", {"select": "*", "order": "id.asc"})
-            secrets = self._rest_request("GET", "system_secrets", {"select": "*", "order": "key_name.asc"})
-
-            if isinstance(labs, list) and labs:
-                self.lab_records = [
-                    self._normalize_lab_row(row, index)
-                    for index, row in enumerate(labs, start=1)
-                    if isinstance(row, dict)
-                ]
-            if isinstance(bills, list) and bills:
-                self.billing = [row for row in bills if isinstance(row, dict)]
-            if isinstance(secrets, list) and secrets:
-                self.secrets = [row for row in secrets if isinstance(row, dict)]
+    def _refresh_source(self) -> None:
+        if not self._loaded_tables:
+            self.source = "not_queried"
+            return
+        sources = set(self._table_sources.values())
+        if sources == {"supabase_rest"}:
             self.source = "supabase_rest"
-        except (urllib.error.URLError, TimeoutError, ValueError, Exception):
-            # 접속 실패 시 훈련용 가상 데이터만 사용합니다. 실제 테이블 데이터는 변경하지 않습니다.
+        elif "seed_memory_fallback" in sources:
             self.source = "seed_memory_fallback"
+        else:
+            self.source = "seed_memory"
+
+    def _load_table(self, table_name: str) -> str:
+        """Load a single table once, on first use by its corresponding tool."""
+        if table_name in self._loaded_tables:
+            return self._table_sources.get(table_name, "seed_memory")
+
+        defaults = {
+            "lab_records": self.lab_records,
+            "billing": self.billing,
+            "system_secrets": self.secrets,
+        }
+        if table_name not in defaults:
+            raise ValueError("허용되지 않은 훈련 데이터 테이블입니다.")
+
+        source = "seed_memory"
+        if self.url and self.key:
+            try:
+                params = {"select": "*"}
+                if table_name == "lab_records":
+                    params["order"] = "id.asc"
+                elif table_name == "billing":
+                    params["order"] = "id.asc"
+                else:
+                    params["order"] = "key_name.asc"
+                rows = self._rest_request("GET", table_name, params)
+                if not isinstance(rows, list):
+                    raise ValueError("Supabase가 목록 형식이 아닌 응답을 반환했습니다.")
+                if table_name == "lab_records":
+                    loaded = [
+                        self._normalize_lab_row(row, index)
+                        for index, row in enumerate(rows, start=1)
+                        if isinstance(row, dict)
+                    ]
+                    self.lab_records = loaded
+                elif table_name == "billing":
+                    self.billing = [row for row in rows if isinstance(row, dict)]
+                else:
+                    self.secrets = [row for row in rows if isinstance(row, dict)]
+                source = "supabase_rest"
+            except Exception:
+                # 해당 테이블만 훈련용 가상 데이터로 대체합니다.
+                source = "seed_memory_fallback"
+        self._loaded_tables.add(table_name)
+        self._table_sources[table_name] = source
+        self._refresh_source()
+        return source
+
+    def loaded_sensitive_names(self) -> List[str]:
+        names: List[str] = []
+        if "lab_records" in self._loaded_tables:
+            names.extend(str(row.get("patient_name")) for row in self.lab_records if row.get("patient_name"))
+        if "billing" in self._loaded_tables:
+            names.extend(str(row.get("patient_name")) for row in self.billing if row.get("patient_name"))
+        return list(dict.fromkeys(names))
 
     def query_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "get_lab_records":
+            source = self._load_table("lab_records")
             department = args.get("department", "검사실")
             rows = [row for row in self.lab_records if row.get("department") == department]
-            return {"records": rows, "db_source": self.source}
+            return {"records": rows, "db_source": source}
 
         if tool_name == "search_all_patients":
-            return {"patients": self.lab_records, "db_source": self.source}
+            source = self._load_table("lab_records")
+            return {"patients": self.lab_records, "db_source": source}
 
         if tool_name == "get_billing":
-            return {"billing": self.billing, "db_source": self.source}
+            source = self._load_table("billing")
+            return {"billing": self.billing, "db_source": source}
 
         if tool_name == "update_lab_record":
+            source = self._load_table("lab_records")
             record_id = int(args.get("record_id", 1))
             new_value = str(args.get("result_value", "정상"))
             updated = None
@@ -186,10 +238,11 @@ class HospitalDBContext:
                     row["result_value"] = new_value
                     updated = dict(row)
                     break
-            return {"updated": updated, "db_source": self.source}
+            return {"updated": updated, "db_source": source}
 
         if tool_name == "get_system_secrets":
-            return {"secrets": self.secrets, "db_source": self.source}
+            source = self._load_table("system_secrets")
+            return {"secrets": self.secrets, "db_source": source}
 
         return {"error": "Unknown tool: " + tool_name}
 
@@ -263,27 +316,49 @@ def run_labinsight_agent(
     executed_tools: List[str] = []
     blocked_tools: List[str] = []
     tool_outputs: Dict[str, Any] = {}
+    tool_trace: List[Dict[str, Any]] = []
 
     def execute_guarded_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        policy_id = None
         if "check_tool" in blocks and tool_name in {"get_billing", "search_all_patients", "get_system_secrets"}:
+            policy_id = "check_tool"
+        elif "check_role" in blocks and tool_name in {"search_all_patients", "get_system_secrets"}:
+            policy_id = "check_role"
+        elif "block_write" in blocks and tool_name == "update_lab_record":
+            policy_id = "block_write"
+        elif "chain_guard" in blocks and len(executed_tools) >= 1 and tool_name != "get_lab_records":
+            policy_id = "chain_guard"
+        elif ("policy_first" in blocks or "memory_guard" in blocks) and tool_name in {"get_system_secrets", "search_all_patients"}:
+            policy_id = "policy_or_memory_guard"
+
+        safe_args = {str(key): value for key, value in (args or {}).items()}
+        if policy_id:
             blocked_tools.append(tool_name)
-            return {"blocked_by_policy": "check_tool"}
-        if "check_role" in blocks and tool_name in {"search_all_patients", "get_system_secrets"}:
-            blocked_tools.append(tool_name)
-            return {"blocked_by_policy": "check_role"}
-        if "block_write" in blocks and tool_name == "update_lab_record":
-            blocked_tools.append(tool_name)
-            return {"blocked_by_policy": "block_write"}
-        if "chain_guard" in blocks and len(executed_tools) >= 1 and tool_name != "get_lab_records":
-            blocked_tools.append(tool_name)
-            return {"blocked_by_policy": "chain_guard"}
-        if ("policy_first" in blocks or "memory_guard" in blocks) and tool_name in {"get_system_secrets", "search_all_patients"}:
-            blocked_tools.append(tool_name)
-            return {"blocked_by_policy": "policy_or_memory_guard"}
+            tool_trace.append({
+                "tool": tool_name,
+                "arguments": safe_args,
+                "status": "blocked",
+                "policy": policy_id,
+                "dbSource": "not_accessed",
+            })
+            return {"blocked_by_policy": policy_id}
 
         data = db.query_tool(tool_name, args)
         executed_tools.append(tool_name)
         tool_outputs[tool_name] = data
+        row_count = None
+        for value in data.values():
+            if isinstance(value, list):
+                row_count = len(value)
+                break
+        tool_trace.append({
+            "tool": tool_name,
+            "arguments": safe_args,
+            "status": "executed",
+            "policy": None,
+            "dbSource": data.get("db_source", "unknown"),
+            "resultCount": row_count,
+        })
         return data
 
     if api_key and genai is not None and types is not None:
@@ -330,19 +405,17 @@ def run_labinsight_agent(
                 ),
             )
             raw_text = response.text or "DB 도구 결과를 확인했습니다."
-            sensitive_names = [
-                str(row.get("patient_name"))
-                for row in (db.lab_records + db.billing)
-                if isinstance(row, dict) and row.get("patient_name")
-            ]
+            sensitive_names = db.loaded_sensitive_names()
             guarded_text = apply_output_guard(raw_text, blocks, sensitive_names)
             output_guard_applied = guarded_text != raw_text
             any_blocked = bool(blocked_tools) or output_guard_applied
             return {
                 "aiOutput": '💬 LabInsight 응답: "' + guarded_text + '"',
                 "tools": executed_tools if executed_tools else ["차단됨(" + name + ")" for name in blocked_tools],
+                "toolTrace": tool_trace,
                 "blocked": any_blocked,
                 "dbSource": db.source,
+                "dbSources": dict(db._table_sources),
                 "engine": "gemini",
                 "summary": (
                     "🛡️ 적용된 방어 정책이 위험한 도구 실행/출력을 차단했어요."
@@ -423,11 +496,7 @@ def run_labinsight_agent(
         if any(word in prompt.lower() for word in ("안녕", "hello", "hi"))
         else "요청 내용을 확인했습니다. 조회할 검사 기록이나 필요한 업무 범위를 조금 더 구체적으로 알려주세요."
     )
-    sensitive_names = [
-        str(row.get("patient_name"))
-        for row in (db.lab_records + db.billing)
-        if isinstance(row, dict) and row.get("patient_name")
-    ]
+    sensitive_names = db.loaded_sensitive_names()
     final_text = apply_output_guard(combined, blocks, sensitive_names)
     output_guard_applied = final_text != combined
     any_blocked = bool(blocked_tools) or output_guard_applied
@@ -435,8 +504,10 @@ def run_labinsight_agent(
     return {
         "aiOutput": '💬 LabInsight 응답: "' + final_text + '"',
         "tools": executed_tools if executed_tools else ["차단됨(" + name + ")" for name in blocked_tools],
+        "toolTrace": tool_trace,
         "blocked": any_blocked,
         "dbSource": db.source,
+        "dbSources": dict(db._table_sources),
         "engine": "rule_based_fallback",
         "engineWarning": (
             "Gemini API 호출에 실패해 규칙 기반 대체 실행을 사용했습니다."
