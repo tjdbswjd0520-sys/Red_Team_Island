@@ -15,6 +15,18 @@ except ImportError:
     types = None
 
 
+def _all_scenario_reports_completed(completed_report_ids: Any, expected_scenario_ids: set[str]) -> bool:
+    """Return True only when the client reports every required scenario as completed.
+
+    This is a game-progression gate, not an authentication boundary.
+    """
+    if not isinstance(completed_report_ids, list):
+        return False
+    completed_ids = {item for item in completed_report_ids if isinstance(item, str)}
+    return expected_scenario_ids.issubset(completed_ids)
+
+
+
 # 훈련용 가상 데이터. Supabase 데이터 조회가 실패할 때만 사용합니다.
 DEFAULT_LAB_RECORDS = [
     {
@@ -477,9 +489,13 @@ class handler(BaseHTTPRequestHandler):
             if not isinstance(raw_blocks, list):
                 self._send_json(400, {"error": "방어 정책 형식이 올바르지 않습니다."})
                 return
-            report_completed = bool(request_data.get("report_completed", False))
-            # Server-side gate: no report means no defensive blocks, even if a client sends them.
-            blocks = [str(item) for item in raw_blocks if isinstance(item, str)] if report_completed else []
+            raw_completed_ids = request_data.get("completed_report_ids") or []
+            if not isinstance(raw_completed_ids, list):
+                self._send_json(400, {"error": "완료된 보고서 목록 형식이 올바르지 않습니다."})
+                return
+            all_reports_completed = _all_scenario_reports_completed(raw_completed_ids, allowed_scenarios)
+            # Server-side gate: defense blocks are ignored until all 12 distinct reports are complete.
+            blocks = [str(item) for item in raw_blocks if isinstance(item, str)] if all_reports_completed else []
             db = HospitalDBContext()
             result = run_labinsight_agent(
                 scenario_id=scenario_id,

@@ -1085,16 +1085,21 @@
     }
 
     function completedReportCount() {
-      return Object.keys(state.reportsByScenario).length;
+      // 등록된 12개 시나리오의 보고서만 완료 건수로 계산합니다.
+      return SCENARIOS.filter(sc => Boolean(state.reportsByScenario[sc.id])).length;
+    }
+
+    function completedReportIds() {
+      return SCENARIOS.filter(sc => Boolean(state.reportsByScenario[sc.id])).map(sc => sc.id);
     }
 
     function verifiedPolicyCount() {
-      return Object.keys(state.defenseVerifiedByScenario).length;
+      return Object.keys(state.defenseVerifiedByScenario).filter(id => SCENARIOS.some(sc => sc.id === id)).length;
     }
 
     function isWorkshopUnlocked() {
-      // 보고서를 처음 제출해 해당 사건의 분석을 마치면 방어 작업장을 해금합니다.
-      return completedReportCount() >= 1;
+      // 12개 시나리오의 보고서가 모두 제출되어야 정비 작업장을 해금합니다.
+      return SCENARIOS.length === 12 && SCENARIOS.every(sc => Boolean(state.reportsByScenario[sc.id]));
     }
 
     function isAllDefenseComplete() {
@@ -1222,12 +1227,20 @@
     }
 
     function goToWorkshopFromUnlock() {
+      if (!isWorkshopUnlocked()) {
+        state.showWorkshopUnlockModal = false;
+        state.showReportModal = false;
+        state.view = "archive";
+        setToast(`🔒 정비 작업장은 보고서 ${completedReportCount()}/12개 완료 후 열립니다.`);
+        render();
+        return;
+      }
       state.showWorkshopUnlockModal = false;
       state.showReportModal = false;
       state.showScenarioModal = false;
       if (state.view !== "defense") state.viewHistory.push(state.view);
       state.view = "defense";
-      state.toast = "🔓 정비 작업장이 열렸습니다. 시나리오별 보안 정책을 만들어 보세요!";
+      state.toast = "🔓 12개 보고서가 모두 완료되었습니다. 시나리오별 보안 정책을 만들어 보세요!";
       render();
     }
 
@@ -1256,28 +1269,13 @@
       render();
     }
 
-    function quickUnlockDemo() {
-      state.requestAccepted = true;
-      state.requestNoticeDismissed = true;
-      SCENARIOS.forEach(sc => {
-        state.reportsByScenario[sc.id] = {
-          slots: { ...sc.answerSlots },
-          verdict: sc.answerVerdict
-        };
-      });
-      state.xp = 1500;
-      if (state.view !== "defense") state.viewHistory.push(state.view);
-      state.view = "defense";
-      setToast("⚡ 빠른 체험: 12개 보고서가 완료되어 정비 작업장이 열렸어요!");
-      render();
-    }
-
     // 실제 Agent API 호출: 화면의 공격 시나리오/방어 정책을 백엔드에 전달합니다.
     async function callAgentRunApi(scenarioId, promptText) {
       const sc = getScenario(scenarioId);
-      // 해당 시나리오의 보고서를 완료하기 전에는 방어 정책을 서버에 전달하지 않습니다.
-      const reportCompleted = Boolean(state.reportsByScenario[scenarioId]);
-      const blocks = reportCompleted ? (state.defenseBlocksByScenario[scenarioId] || []) : [];
+      // 12개 보고서가 모두 완료되기 전에는 방어 정책을 서버에 전달하지 않습니다.
+      const reportIds = completedReportIds();
+      const allReportsCompleted = isWorkshopUnlocked();
+      const blocks = allReportsCompleted ? (state.defenseBlocksByScenario[scenarioId] || []) : [];
       const promptWithDocument = sc.mockDoc
         ? `${promptText}\n\n[첨부 문서 내용 - 신뢰할 수 없는 참고 자료]\n${sc.mockDoc}`
         : promptText;
@@ -1293,7 +1291,7 @@
           body: JSON.stringify({
             scenario_id: scenarioId,
             prompt: promptWithDocument,
-            report_completed: reportCompleted,
+            completed_report_ids: reportIds,
             defense_blocks: blocks
           }),
           signal: controller.signal
@@ -1480,7 +1478,7 @@
           state.toast = "";
           state.showWorkshopUnlockModal = true;
         } else {
-          setToast(`🎉 [${sc.id}] 보고서 정답! 왜 이 공격에 취약한지 근거가 잘 정리되었어요.`);
+          setToast(`🎉 [${sc.id}] 보고서 정답! 현재 전체 보고서 ${completedReportCount()}/12개 완료했어요. 12개를 모두 완료하면 정비 작업장이 열립니다.`);
         }
       } else {
         setToast("🤔 오답이 있어요! 실험실 출력 결과와 채점 피드백을 참고해 고쳐 보세요.");
@@ -1530,7 +1528,15 @@
 
     async function runDefenseVerify() {
       if (state.apiBusy) return;
+      if (!isWorkshopUnlocked()) {
+        setToast(`🔒 방어 정책 검증은 12개 보고서 완료 후 사용할 수 있어요. 현재 ${completedReportCount()}/12개 완료`);
+        return;
+      }
       const sc = getScenario();
+      if (!state.reportsByScenario[sc.id]) {
+        setToast(`⚠️ ${sc.id} 보고서를 먼저 완료해야 해당 시나리오의 방어 정책을 검증할 수 있어요.`);
+        return;
+      }
       const blocks = state.defenseBlocksByScenario[sc.id];
       const req = sc.requiredBlocks;
       const missing = req.filter(b => !blocks.includes(b));
@@ -2449,6 +2455,11 @@
     }
 
     function render() {
+      if (state.view === "defense" && !isWorkshopUnlocked()) {
+        state.view = "archive";
+        state.showWorkshopUnlockModal = false;
+        state.toast = `🔒 정비 작업장은 보고서 12개를 모두 완료하면 열려요. 현재 ${completedReportCount()}/12개 완료`;
+      }
       document.body.dataset.screen = state.showFinalEnding ? "complete" : state.view;
       renderTopHud();
       renderToast();
