@@ -708,25 +708,92 @@
       render();
     }
 
-    async function callAgentRunApi({ scenarioId, mode, prompt, activeBlocks }) {
-      try {
-        const res = await fetch("/api/agent/run", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            scenario_id: scenarioId,
-            mode,
-            prompt,
-            active_blocks: activeBlocks || []
-          })
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return await res.json();
-      } catch (err) {
-        console.warn("API fallback:", err);
-        return null;
+  async function callAgentRunApi({ scenarioId, mode, prompt, activeBlocks }) {
+    // 게임의 시나리오 번호를 백엔드에서 사용하는 번호로 변환
+    const scenarioMap = {
+      S01: "A-01",
+      S02: "B-01",
+      S03: "B-03",
+      S04: "B-02",
+      S05: "B-01",
+      S06: "I-02",
+      S07: "I-01",
+      S08: "M-01",
+      S09: "A-03",
+      S10: "A-01",
+      S11: "A-05",
+      S12: "A-04"
+    };
+
+    // 게임의 방어 블록 ID를 백엔드 규칙 ID로 변환
+    const defenseBlockMap = {
+      allow_lab_only: "check_tool",
+      block_billing: "check_tool",
+      block_pii: "mask_pii",
+      block_override: "policy_first",
+      untrusted_doc_data: "policy_first",
+      block_sys_leak: "output_filter",
+      enforce_dept_scope: "check_role",
+      protect_memory: "memory_guard",
+      require_write_approval: "block_write"
+    };
+
+    const backendBlocks = [
+      ...new Set(
+        (activeBlocks || [])
+          .map(blockId => defenseBlockMap[blockId])
+          .filter(Boolean)
+      )
+    ];
+
+    try {
+      const res = await fetch("/api/agent/run", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          scenario_id: scenarioMap[scenarioId] || scenarioId,
+
+          // 정상 업무 점검은 공격 테스트와 구분
+          is_normal:
+            mode === "defense_normal" ||
+            scenarioId === "S10",
+
+          prompt: prompt,
+
+          // 백엔드가 인식하는 방어 정책 목록
+          defense_blocks: backendBlocks
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error(`서버 응답 오류: HTTP ${res.status}`);
       }
+
+      const result = await res.json();
+
+      // 백엔드의 응답 이름을 기존 게임 코드와 호환되도록 변환
+      return {
+        ...result,
+        ai_output: result.aiOutput ?? result.ai_output,
+        tools_called: result.tools ?? result.tools_called,
+        db_source: result.dbSource ?? result.db_source
+      };
+
+    } catch (err) {
+      console.error("LabInsight API 실행 오류:", err);
+
+      // 연결 실패를 정상적인 공격 결과처럼 표시하지 않도록 구분
+      return {
+        ai_output: `⚠️ AI 서버 실행 오류: ${err.message}`,
+        tools_called: [],
+        blocked: false,
+        db_source: "api-error",
+        api_error: true
+      };
     }
+  }
 
     async function runAttackTest() {
       if (state.isRunningAgent) return;
